@@ -107,17 +107,18 @@ const APP_LOGO = "https://up6.cc/2026/11/179555196156461.png";
 
 /* ============ State ============ */
 const S = {
-  user: null,           // { uid, email, name, photo, phone, areaId, areaName }
-  tempGoogleUser: null, // بيانات جوجل المؤقتة قبل إكمال رقم الهاتف والمنطقة
+  user: null,
+  tempGoogleUser: null,
   page: 'splash',
   categories: {},
   products: {},
-  cart: {},             // { productId: qty }
+  cart: {},
   areas: {},
   activeCategory: 'all',
   myOrders: [],
   settings: {},
-  authLoading: false
+  authLoading: false,
+  currentProduct: null
 };
 
 const app = document.getElementById('app');
@@ -130,18 +131,34 @@ function goTo(p){S.page=p;render()}
 function saveSession(){if(S.user)localStorage.setItem('bizo_user',JSON.stringify(S.user))}
 function clearSession(){localStorage.removeItem('bizo_user')}
 function loadSession(){try{const u=localStorage.getItem('bizo_user');if(u)return JSON.parse(u)}catch(e){}return null}
+function saveCurrentProduct(){try{if(S.currentProduct)sessionStorage.setItem('bizo_current_product',S.currentProduct);else sessionStorage.removeItem('bizo_current_product')}catch(e){}}
+function loadCurrentProduct(){try{return sessionStorage.getItem('bizo_current_product')}catch(e){return null}}
 
 /* ============ Init ============ */
 function init(){
   S.user = loadSession();
+  S.currentProduct = loadCurrentProduct();
+
   db.ref('categories').on('value',s=>{S.categories=s.val()||{};if(S.page==='shop')render()});
-  db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop')render()});
+  db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop'||S.page==='product')render()});
   db.ref('deliveryAreas').on('value',s=>{
     S.areas=s.val()||{};
     if(S.page==='completeProfile'||S.page==='checkout')render();
   });
   db.ref('appSettings').on('value',s=>{S.settings=s.val()||{}});
   db.ref('sections').on('value',s=>{S.sections=s.val()||{}});
+
+  /* مراقبة حالة Firebase Auth للتأكد من تطابق الجلسة المحلية */
+  auth.onAuthStateChanged(fbUser => {
+    if (!fbUser && S.user && !S.tempGoogleUser) {
+      // الجلسة المحلية موجودة لكن Firebase لا يعرف المستخدم -> امسح
+      clearSession();
+      S.user = null;
+      if (S.page !== 'splash' && S.page !== 'completeProfile') {
+        goTo('splash');
+      }
+    }
+  });
 
   if(S.user && S.user.phone && S.user.areaId){
     goTo('shop');
@@ -173,7 +190,7 @@ function render(){
 /* ============ Splash / Google Login ============ */
 function renderSplash(){
   return `<div class="page" style="justify-content:center;text-align:center">
-    <img src="${APP_LOGO}" alt="بيزو" class="app-logo-img">
+    <img src="${APP_LOGO}" alt="بيزو" class="app-logo-img" onerror="this.style.display='none'">
     <div class="logo">بيزو</div>
     <p class="tag">متجرك الإلكتروني الشامل</p>
     <div style="margin-top:48px">
@@ -187,24 +204,36 @@ function renderSplash(){
         <span>${S.authLoading?'جاري الاتصال بجوجل...':'المتابعة باستخدام Google'}</span>
       </button>
     </div>
+    <p style="margin-top:24px;font-size:.75rem;color:var(--muted)">بالمتابعة أنت توافق على شروط الاستخدام</p>
   </div>`;
 }
 
-/* ============ Google Auth Logic ============ */
+/* ============ Google Auth Logic (مُصلح) ============ */
 async function loginWithGoogle(){
-  if(S.authLoading)return;
-  S.authLoading=true;
+  if(S.authLoading) return;
+  S.authLoading = true;
   render();
-  try{
-    const result = await auth.signInWithPopup(googleProvider);
+
+  // مؤقت احتياطي: إذا تجاوزت العملية 20 ثانية نعيد الزر ونظهر رسالة
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('TIMEOUT')), 20000);
+  });
+
+  try {
+    const result = await Promise.race([
+      auth.signInWithPopup(googleProvider),
+      timeoutPromise
+    ]);
+    clearTimeout(timeoutId);
+
     const gUser = result.user;
-    
-    // البحث عن المستخدم في قاعدة البيانات عبر uid
+
+    // البحث عن المستخدم في قاعدة البيانات
     const snap = await db.ref('users/' + gUser.uid).get();
     const existingData = snap.val();
 
-    if(existingData && existingData.phone && existingData.areaId){
-      // مستخدم مسجل مسبقاً ومكتمل البيانات
+    if (existingData && existingData.phone && existingData.areaId) {
       S.user = {
         uid: gUser.uid,
         email: gUser.email || existingData.email || '',
@@ -215,30 +244,50 @@ async function loginWithGoogle(){
         areaName: existingData.areaName || ''
       };
       saveSession();
-      S.authLoading=false;
+      S.authLoading = false;
       toast('مرحباً بعودتك ' + S.user.name);
       goTo('shop');
     } else {
-      // مستخدم جديد أو بياناته غير مكتملة -> التوجيه لإدخال الهاتف والمنطقة
       S.tempGoogleUser = {
         uid: gUser.uid,
         email: gUser.email || '',
         name: gUser.displayName || '',
         photo: gUser.photoURL || ''
       };
-      S.authLoading=false;
+      S.authLoading = false;
       goTo('completeProfile');
     }
-  }catch(e){
-    S.authLoading=false;
-    render();
-    if(e.code !== 'auth/popup-closed-by-user'){
-      toast('حدث خطأ أثناء الدخول: ' + e.message);
+  } catch (e) {
+    clearTimeout(timeoutId);
+    S.authLoading = false;
+
+    // التعامل مع الأخطاء الشائعة
+    if (e.message === 'TIMEOUT') {
+      render();
+      toast('انتهت مهلة الاتصال. تحقق من اتصالك بالإنترنت أو من إعدادات المتصفح (قد يكون مانع النوافذ المنبثقة مفعّلاً).');
+      return;
     }
+    if (e.code === 'auth/popup-closed-by-user') {
+      // المستخدم أغلق النافذة يدوياً -> لا نعرض خطأ، فقط نعيد الزر
+      render();
+      return;
+    }
+    if (e.code === 'auth/popup-blocked') {
+      render();
+      toast('المتصفح منع النافذة المنبثقة. اسمح بها أو استخدم متصفحاً آخر.');
+      return;
+    }
+    if (e.code === 'auth/cancelled-popup-request') {
+      render();
+      return;
+    }
+    render();
+    toast('حدث خطأ أثناء الدخول: ' + (e.message || e.code || 'خطأ غير معروف'));
+    console.error('Google login error:', e);
   }
 }
 
-/* ============ Complete Profile (Phone & Area - No OTP) ============ */
+/* ============ Complete Profile ============ */
 function renderCompleteProfile(){
   if(!S.tempGoogleUser){goTo('splash');return ''}
   const areas = Object.entries(S.areas).filter(([id,a])=>a.enabled!==false);
@@ -331,8 +380,8 @@ function renderShop(){
         <div style="font-size:.85rem;color:var(--muted)">أهلاً بك 👋</div>
         <div style="font-weight:800;font-size:1.2rem">${esc(S.user.name||S.user.phone)}</div>
       </div>
-      ${S.user.photo 
-        ? `<img src="${esc(S.user.photo)}" class="user-avatar" style="cursor:pointer" onclick="goTo('account')" alt="حسابي">` 
+      ${S.user.photo
+        ? `<img src="${esc(S.user.photo)}" class="user-avatar" style="cursor:pointer" onclick="goTo('account')" alt="حسابي">`
         : `<button class="back-btn" onclick="goTo('account')">👤</button>`}
     </div>
     <div class="cat-pills">
@@ -359,8 +408,8 @@ function setCategory(id){S.activeCategory=id;render()}
 
 /* ============ Product ============ */
 function renderProduct(){
-  const id=S.page==='product'?S.currentProduct:null;
-  const p=S.products[id];
+  const id = S.currentProduct;
+  const p = S.products[id];
   if(!p){goTo('shop');return ''}
   const qty=S.cart[id]||0;
   return `<div class="page">
@@ -391,7 +440,11 @@ function renderProduct(){
   </div>`;
 }
 
-function openProduct(id){S.currentProduct=id;goTo('product')}
+function openProduct(id){
+  S.currentProduct = id;
+  saveCurrentProduct();
+  goTo('product');
+}
 
 /* ============ Cart ============ */
 function renderCart(){
@@ -552,14 +605,30 @@ function renderOrders(){
   </div>`;
 }
 
+let ordersListenerRef = null;
+
 function loadMyOrders(){
   const el=document.getElementById('ordersList');
-  if(!el)return;
-  db.ref('orders').orderByChild('userPhone').equalTo(S.user.phone).on('value',s=>{
-    const data=s.val()||{};
-    const arr=Object.values(data).sort((a,b)=>b.createdAt-a.createdAt);
-    if(!arr.length){el.innerHTML='<div class="empty"><div class="empty-icon">📋</div><p>لا توجد طلبات بعد</p></div>';return}
-    el.innerHTML=arr.map(o=>{
+  if(!el) return;
+
+  // إلغاء أي مستمع قديم
+  if (ordersListenerRef) {
+    ordersListenerRef.off();
+    ordersListenerRef = null;
+  }
+
+  // الاستعلام بـ userUid (أكثر أماناً من userPhone)
+  ordersListenerRef = db.ref('orders').orderByChild('userUid').equalTo(S.user.uid);
+  ordersListenerRef.on('value', s => {
+    const data = s.val() || {};
+    const arr = Object.values(data).sort((a,b)=>b.createdAt-a.createdAt);
+    const el2 = document.getElementById('ordersList');
+    if (!el2) return;
+    if(!arr.length){
+      el2.innerHTML='<div class="empty"><div class="empty-icon">📋</div><p>لا توجد طلبات بعد</p></div>';
+      return;
+    }
+    el2.innerHTML=arr.map(o=>{
       const st=o.status||'new';
       const badge={new:'جديد',preparing:'قيد التجهيز',delivering:'قيد التوصيل',completed:'مكتمل',cancelled:'ملغي'}[st]||st;
       return `<div class="cart-item" style="flex-direction:column;align-items:stretch">
@@ -603,7 +672,9 @@ function renderAccount(){
 function logout(){
   auth.signOut().catch(()=>{});
   clearSession();
-  S.user=null;S.cart={};S.tempGoogleUser=null;
+  S.user=null;S.cart={};S.tempGoogleUser=null;S.currentProduct=null;
+  try{sessionStorage.removeItem('bizo_current_product')}catch(e){}
+  if (ordersListenerRef) { ordersListenerRef.off(); ordersListenerRef = null; }
   goTo('splash');
 }
 
