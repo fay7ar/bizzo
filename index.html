@@ -78,10 +78,11 @@ h2{font-size:1.6rem;margin-bottom:20px;text-align:right}
 .badge-cancelled{background:#fee2e2;color:#991b1b}
 .empty{text-align:center;padding:60px 20px;color:var(--muted)}
 .empty-icon{font-size:4rem;margin-bottom:16px}
-.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--white);padding:12px 24px;border-radius:12px;z-index:999;font-weight:700;box-shadow:0 8px 24px rgba(0,0,0,.3);animation:slideIn .3s}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--white);padding:12px 24px;border-radius:12px;z-index:999;font-weight:700;box-shadow:0 8px 24px rgba(0,0,0,.3);animation:slideIn .3s;max-width:90%;text-align:center}
 @keyframes slideIn{from{opacity:0;transform:translate(-50%,-20px)}to{opacity:1;transform:translate(-50%,0)}}
 .loading{text-align:center;padding:40px;color:var(--muted)}
 .user-avatar{width:42px;height:42px;border-radius:14px;object-fit:cover;border:1.5px solid var(--border)}
+.err-box{background:#fee2e2;border:1.5px solid #fecaca;border-radius:12px;padding:12px;margin-top:16px;font-size:.8rem;color:#991b1b;text-align:right;word-break:break-word}
 </style>
 </head>
 <body>
@@ -119,14 +120,14 @@ const S = {
   settings: {},
   authLoading: false,
   currentProduct: null,
-  redirecting: false
+  lastError: ''
 };
 
 const app = document.getElementById('app');
 
 /* ============ Helpers ============ */
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2800)}
+function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3500)}
 function money(n){return (Number(n)||0).toLocaleString('ar-LY')+' د.ل'}
 function goTo(p){S.page=p;render()}
 function saveSession(){if(S.user)localStorage.setItem('bizo_user',JSON.stringify(S.user))}
@@ -135,54 +136,71 @@ function loadSession(){try{const u=localStorage.getItem('bizo_user');if(u)return
 function saveCurrentProduct(){try{if(S.currentProduct)sessionStorage.setItem('bizo_current_product',S.currentProduct);else sessionStorage.removeItem('bizo_current_product')}catch(e){}}
 function loadCurrentProduct(){try{return sessionStorage.getItem('bizo_current_product')}catch(e){return null}}
 
-/* ============ Init (يرسم فوراً ثم يعالج Redirect في الخلفية) ============ */
+/* ============ Init ============ */
 function init(){
   S.user = loadSession();
   S.currentProduct = loadCurrentProduct();
 
-  // رسم أولي فوري — لا شيء يحجب الواجهة
-  if(S.user && S.user.phone && S.user.areaId){
-    S.page = 'shop';
-  } else {
-    S.page = 'splash';
-  }
+  S.page = (S.user && S.user.phone && S.user.areaId) ? 'shop' : 'splash';
   render();
 
-  // ربط البيانات في الخلفية
   db.ref('categories').on('value',s=>{S.categories=s.val()||{};if(S.page==='shop')render()});
   db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop'||S.page==='product')render()});
-  db.ref('deliveryAreas').on('value',s=>{
-    S.areas=s.val()||{};
-    if(S.page==='completeProfile'||S.page==='checkout')render();
-  });
+  db.ref('deliveryAreas').on('value',s=>{S.areas=s.val()||{};if(S.page==='completeProfile'||S.page==='checkout')render()});
   db.ref('appSettings').on('value',s=>{S.settings=s.val()||{}});
 
-  // معالجة Redirect في الخلفية (لا تحجب الواجهة)
-  auth.getRedirectResult().then(async (result) => {
-    if (result && result.user) {
-      S.redirecting = true;
-      await finishGoogleLogin(result.user);
-      S.redirecting = false;
-    }
-  }).catch((e) => {
-    // تجاهل أخطاء الإلغاء
-    if (e && e.code && e.code !== 'auth/cancelled-popup-request') {
-      console.warn('Redirect result error:', e.code, e.message);
+  auth.onAuthStateChanged(fbUser => {
+    if (!fbUser && S.user && !S.tempGoogleUser && !S.authLoading) {
+      clearSession();
+      S.user = null;
+      if (S.page !== 'splash' && S.page !== 'completeProfile') goTo('splash');
     }
   });
+}
 
-  // مراقبة حالة Auth
-  auth.onAuthStateChanged(fbUser => {
-    if (!fbUser) {
-      if (S.user && !S.tempGoogleUser && !S.redirecting && !S.authLoading) {
-        clearSession();
-        S.user = null;
-        if (S.page !== 'splash' && S.page !== 'completeProfile') {
-          goTo('splash');
-        }
+/* ============ Google Login — Popup أولاً، Redirect كبديل ============ */
+async function loginWithGoogle(){
+  if(S.authLoading) return;
+  S.authLoading = true;
+  S.lastError = '';
+  render();
+
+  try {
+    // المحاولة 1: Popup (يعمل في معظم البيئات)
+    const result = await auth.signInWithPopup(googleProvider);
+    S.authLoading = false;
+    await finishGoogleLogin(result.user);
+    return;
+  } catch (e) {
+    console.warn('Popup failed:', e.code, e.message);
+
+    // إذا أغلق المستخدم النافذة يدوياً — لا داعي للبديل
+    if (e.code === 'auth/popup-closed-by-user') {
+      S.authLoading = false;
+      render();
+      return;
+    }
+
+    // إذا كان الخطأ "popup-blocked" أو غيره — جرّب Redirect
+    if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment' || e.code === 'auth/cancelled-popup-request') {
+      try {
+        await auth.signInWithRedirect(googleProvider);
+        return;
+      } catch (e2) {
+        S.authLoading = false;
+        S.lastError = (e2.code || '') + ' — ' + (e2.message || '');
+        render();
+        toast('تعذر تسجيل الدخول');
+        return;
       }
     }
-  });
+
+    // خطأ آخر — اعرض التفاصيل للمستخدم
+    S.authLoading = false;
+    S.lastError = (e.code || '') + ' — ' + (e.message || '');
+    render();
+    toast('تعذر تسجيل الدخول: ' + (e.code || e.message || ''));
+  }
 }
 
 /* ============ إكمال تسجيل الدخول ============ */
@@ -203,7 +221,6 @@ async function finishGoogleLogin(gUser){
       };
       saveSession();
       S.authLoading = false;
-      S.redirecting = false;
       toast('مرحباً بعودتك ' + S.user.name);
       goTo('shop');
     } else {
@@ -214,14 +231,13 @@ async function finishGoogleLogin(gUser){
         photo: gUser.photoURL || ''
       };
       S.authLoading = false;
-      S.redirecting = false;
       goTo('completeProfile');
     }
   } catch (e) {
     S.authLoading = false;
-    S.redirecting = false;
-    toast('خطأ في قراءة البيانات: ' + (e.message || ''));
+    S.lastError = (e.code || '') + ' — ' + (e.message || '');
     render();
+    toast('خطأ في قراءة البيانات');
   }
 }
 
@@ -242,22 +258,8 @@ function renderSplash(){
         <span>${S.authLoading?'جاري الاتصال بجوجل...':'المتابعة باستخدام Google'}</span>
       </button>
     </div>
+    ${S.lastError ? `<div class="err-box"><b>سبب الخطأ:</b><br>${esc(S.lastError)}</div>` : ''}
   </div>`;
-}
-
-/* ============ Google Login: Redirect مباشرة (الأكثر موثوقية) ============ */
-async function loginWithGoogle(){
-  if(S.authLoading) return;
-  S.authLoading = true;
-  render();
-  try {
-    await auth.signInWithRedirect(googleProvider);
-    // ستتم إعادة توجيه الصفحة إلى جوجل، ثم العودة
-  } catch (e) {
-    S.authLoading = false;
-    render();
-    toast('تعذر فتح صفحة جوجل: ' + (e.message || e.code || ''));
-  }
 }
 
 /* ============ Complete Profile ============ */
