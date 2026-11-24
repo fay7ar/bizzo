@@ -102,6 +102,7 @@ firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 const auth = firebase.auth();
 const googleProvider = new firebase.auth.GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 const APP_LOGO = "https://up6.cc/2026/11/179555196156461.png";
 
@@ -115,10 +116,10 @@ const S = {
   cart: {},
   areas: {},
   activeCategory: 'all',
-  myOrders: [],
   settings: {},
   authLoading: false,
-  currentProduct: null
+  currentProduct: null,
+  redirecting: false
 };
 
 const app = document.getElementById('app');
@@ -134,11 +135,20 @@ function loadSession(){try{const u=localStorage.getItem('bizo_user');if(u)return
 function saveCurrentProduct(){try{if(S.currentProduct)sessionStorage.setItem('bizo_current_product',S.currentProduct);else sessionStorage.removeItem('bizo_current_product')}catch(e){}}
 function loadCurrentProduct(){try{return sessionStorage.getItem('bizo_current_product')}catch(e){return null}}
 
-/* ============ Init ============ */
+/* ============ Init (يرسم فوراً ثم يعالج Redirect في الخلفية) ============ */
 function init(){
   S.user = loadSession();
   S.currentProduct = loadCurrentProduct();
 
+  // رسم أولي فوري — لا شيء يحجب الواجهة
+  if(S.user && S.user.phone && S.user.areaId){
+    S.page = 'shop';
+  } else {
+    S.page = 'splash';
+  }
+  render();
+
+  // ربط البيانات في الخلفية
   db.ref('categories').on('value',s=>{S.categories=s.val()||{};if(S.page==='shop')render()});
   db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop'||S.page==='product')render()});
   db.ref('deliveryAreas').on('value',s=>{
@@ -146,48 +156,76 @@ function init(){
     if(S.page==='completeProfile'||S.page==='checkout')render();
   });
   db.ref('appSettings').on('value',s=>{S.settings=s.val()||{}});
-  db.ref('sections').on('value',s=>{S.sections=s.val()||{}});
 
-  /* مراقبة حالة Firebase Auth للتأكد من تطابق الجلسة المحلية */
-  auth.onAuthStateChanged(fbUser => {
-    if (!fbUser && S.user && !S.tempGoogleUser) {
-      // الجلسة المحلية موجودة لكن Firebase لا يعرف المستخدم -> امسح
-      clearSession();
-      S.user = null;
-      if (S.page !== 'splash' && S.page !== 'completeProfile') {
-        goTo('splash');
-      }
+  // معالجة Redirect في الخلفية (لا تحجب الواجهة)
+  auth.getRedirectResult().then(async (result) => {
+    if (result && result.user) {
+      S.redirecting = true;
+      await finishGoogleLogin(result.user);
+      S.redirecting = false;
+    }
+  }).catch((e) => {
+    // تجاهل أخطاء الإلغاء
+    if (e && e.code && e.code !== 'auth/cancelled-popup-request') {
+      console.warn('Redirect result error:', e.code, e.message);
     }
   });
 
-  if(S.user && S.user.phone && S.user.areaId){
-    goTo('shop');
-  }else{
-    goTo('splash');
-  }
-}
-init();
-
-/* ============ Router / Render ============ */
-function render(){
-  if(!S.user && !['splash','completeProfile'].includes(S.page)){
-    goTo('splash');return;
-  }
-  const routes={
-    splash:renderSplash,
-    completeProfile:renderCompleteProfile,
-    shop:renderShop,
-    product:renderProduct,
-    cart:renderCart,
-    checkout:renderCheckout,
-    orders:renderOrders,
-    account:renderAccount
-  };
-  app.innerHTML=(routes[S.page]||renderSplash)();
-  bindEvents();
+  // مراقبة حالة Auth
+  auth.onAuthStateChanged(fbUser => {
+    if (!fbUser) {
+      if (S.user && !S.tempGoogleUser && !S.redirecting && !S.authLoading) {
+        clearSession();
+        S.user = null;
+        if (S.page !== 'splash' && S.page !== 'completeProfile') {
+          goTo('splash');
+        }
+      }
+    }
+  });
 }
 
-/* ============ Splash / Google Login ============ */
+/* ============ إكمال تسجيل الدخول ============ */
+async function finishGoogleLogin(gUser){
+  try {
+    const snap = await db.ref('users/' + gUser.uid).get();
+    const existingData = snap.val();
+
+    if (existingData && existingData.phone && existingData.areaId) {
+      S.user = {
+        uid: gUser.uid,
+        email: gUser.email || existingData.email || '',
+        name: existingData.name || gUser.displayName || 'مستخدم بيزو',
+        photo: gUser.photoURL || existingData.photo || '',
+        phone: existingData.phone,
+        areaId: existingData.areaId,
+        areaName: existingData.areaName || ''
+      };
+      saveSession();
+      S.authLoading = false;
+      S.redirecting = false;
+      toast('مرحباً بعودتك ' + S.user.name);
+      goTo('shop');
+    } else {
+      S.tempGoogleUser = {
+        uid: gUser.uid,
+        email: gUser.email || '',
+        name: gUser.displayName || '',
+        photo: gUser.photoURL || ''
+      };
+      S.authLoading = false;
+      S.redirecting = false;
+      goTo('completeProfile');
+    }
+  } catch (e) {
+    S.authLoading = false;
+    S.redirecting = false;
+    toast('خطأ في قراءة البيانات: ' + (e.message || ''));
+    render();
+  }
+}
+
+/* ============ Splash ============ */
 function renderSplash(){
   return `<div class="page" style="justify-content:center;text-align:center">
     <img src="${APP_LOGO}" alt="بيزو" class="app-logo-img" onerror="this.style.display='none'">
@@ -204,92 +242,27 @@ function renderSplash(){
         <span>${S.authLoading?'جاري الاتصال بجوجل...':'المتابعة باستخدام Google'}</span>
       </button>
     </div>
-    <p style="margin-top:24px;font-size:.75rem;color:var(--muted)">بالمتابعة أنت توافق على شروط الاستخدام</p>
   </div>`;
 }
 
-/* ============ Google Auth Logic (مُصلح) ============ */
+/* ============ Google Login: Redirect مباشرة (الأكثر موثوقية) ============ */
 async function loginWithGoogle(){
   if(S.authLoading) return;
   S.authLoading = true;
   render();
-
-  // مؤقت احتياطي: إذا تجاوزت العملية 20 ثانية نعيد الزر ونظهر رسالة
-  let timeoutId;
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error('TIMEOUT')), 20000);
-  });
-
   try {
-    const result = await Promise.race([
-      auth.signInWithPopup(googleProvider),
-      timeoutPromise
-    ]);
-    clearTimeout(timeoutId);
-
-    const gUser = result.user;
-
-    // البحث عن المستخدم في قاعدة البيانات
-    const snap = await db.ref('users/' + gUser.uid).get();
-    const existingData = snap.val();
-
-    if (existingData && existingData.phone && existingData.areaId) {
-      S.user = {
-        uid: gUser.uid,
-        email: gUser.email || existingData.email || '',
-        name: existingData.name || gUser.displayName || 'مستخدم بيزو',
-        photo: gUser.photoURL || existingData.photo || '',
-        phone: existingData.phone,
-        areaId: existingData.areaId,
-        areaName: existingData.areaName || ''
-      };
-      saveSession();
-      S.authLoading = false;
-      toast('مرحباً بعودتك ' + S.user.name);
-      goTo('shop');
-    } else {
-      S.tempGoogleUser = {
-        uid: gUser.uid,
-        email: gUser.email || '',
-        name: gUser.displayName || '',
-        photo: gUser.photoURL || ''
-      };
-      S.authLoading = false;
-      goTo('completeProfile');
-    }
+    await auth.signInWithRedirect(googleProvider);
+    // ستتم إعادة توجيه الصفحة إلى جوجل، ثم العودة
   } catch (e) {
-    clearTimeout(timeoutId);
     S.authLoading = false;
-
-    // التعامل مع الأخطاء الشائعة
-    if (e.message === 'TIMEOUT') {
-      render();
-      toast('انتهت مهلة الاتصال. تحقق من اتصالك بالإنترنت أو من إعدادات المتصفح (قد يكون مانع النوافذ المنبثقة مفعّلاً).');
-      return;
-    }
-    if (e.code === 'auth/popup-closed-by-user') {
-      // المستخدم أغلق النافذة يدوياً -> لا نعرض خطأ، فقط نعيد الزر
-      render();
-      return;
-    }
-    if (e.code === 'auth/popup-blocked') {
-      render();
-      toast('المتصفح منع النافذة المنبثقة. اسمح بها أو استخدم متصفحاً آخر.');
-      return;
-    }
-    if (e.code === 'auth/cancelled-popup-request') {
-      render();
-      return;
-    }
     render();
-    toast('حدث خطأ أثناء الدخول: ' + (e.message || e.code || 'خطأ غير معروف'));
-    console.error('Google login error:', e);
+    toast('تعذر فتح صفحة جوجل: ' + (e.message || e.code || ''));
   }
 }
 
 /* ============ Complete Profile ============ */
 function renderCompleteProfile(){
-  if(!S.tempGoogleUser){goTo('splash');return ''}
+  if(!S.tempGoogleUser){S.page='splash';return renderSplash()}
   const areas = Object.entries(S.areas).filter(([id,a])=>a.enabled!==false);
   return `<div class="page">
     <div class="header-bar">
@@ -410,7 +383,7 @@ function setCategory(id){S.activeCategory=id;render()}
 function renderProduct(){
   const id = S.currentProduct;
   const p = S.products[id];
-  if(!p){goTo('shop');return ''}
+  if(!p){S.page='shop';return renderShop()}
   const qty=S.cart[id]||0;
   return `<div class="page">
     <div class="header-bar">
@@ -488,7 +461,7 @@ function changeQty(id,d){
 /* ============ Checkout ============ */
 function renderCheckout(){
   const items=Object.entries(S.cart).map(([id,qty])=>({id,qty,p:S.products[id]})).filter(x=>x.p);
-  if(!items.length){goTo('cart');return ''}
+  if(!items.length){S.page='cart';return renderCart()}
   const subtotal=items.reduce((s,x)=>s+x.p.price*x.qty,0);
   const areas=Object.entries(S.areas).filter(([id,a])=>a.enabled!==false);
   const defaultArea = S.areas[S.user.areaId];
@@ -611,13 +584,11 @@ function loadMyOrders(){
   const el=document.getElementById('ordersList');
   if(!el) return;
 
-  // إلغاء أي مستمع قديم
   if (ordersListenerRef) {
     ordersListenerRef.off();
     ordersListenerRef = null;
   }
 
-  // الاستعلام بـ userUid (أكثر أماناً من userPhone)
   ordersListenerRef = db.ref('orders').orderByChild('userUid').equalTo(S.user.uid);
   ordersListenerRef.on('value', s => {
     const data = s.val() || {};
@@ -678,10 +649,41 @@ function logout(){
   goTo('splash');
 }
 
-/* ============ Event binding ============ */
+/* ============ Router ============ */
+function render(){
+  if(!S.user && !['splash','completeProfile'].includes(S.page)){
+    S.page = 'splash';
+  }
+  const routes={
+    splash:renderSplash,
+    completeProfile:renderCompleteProfile,
+    shop:renderShop,
+    product:renderProduct,
+    cart:renderCart,
+    checkout:renderCheckout,
+    orders:renderOrders,
+    account:renderAccount
+  };
+  try {
+    app.innerHTML=(routes[S.page]||renderSplash)();
+  } catch(e) {
+    console.error('Render error:', e);
+    app.innerHTML = `<div class="page" style="justify-content:center;text-align:center">
+      <div style="font-size:3rem;margin-bottom:16px">⚠️</div>
+      <h2 style="color:var(--text)">حدث خطأ</h2>
+      <p style="color:var(--muted);margin-bottom:20px">${esc(e.message)}</p>
+      <button class="btn" onclick="location.reload()">إعادة التحميل</button>
+    </div>`;
+  }
+  bindEvents();
+}
+
 function bindEvents(){
   if(S.page==='orders')loadMyOrders();
 }
+
+/* ============ تشغيل التطبيق ============ */
+init();
 </script>
 </body>
 </html>
