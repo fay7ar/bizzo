@@ -78,11 +78,10 @@ h2{font-size:1.6rem;margin-bottom:20px;text-align:right}
 .badge-cancelled{background:#fee2e2;color:#991b1b}
 .empty{text-align:center;padding:60px 20px;color:var(--muted)}
 .empty-icon{font-size:4rem;margin-bottom:16px}
-.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--white);padding:12px 24px;border-radius:12px;z-index:999;font-weight:700;box-shadow:0 8px 24px rgba(0,0,0,.3);animation:slideIn .3s;max-width:90%;text-align:center}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--white);padding:12px 24px;border-radius:12px;z-index:999;font-weight:700;box-shadow:0 8px 24px rgba(0,0,0,.3);animation:slideIn .3s}
 @keyframes slideIn{from{opacity:0;transform:translate(-50%,-20px)}to{opacity:1;transform:translate(-50%,0)}}
 .loading{text-align:center;padding:40px;color:var(--muted)}
 .user-avatar{width:42px;height:42px;border-radius:14px;object-fit:cover;border:1.5px solid var(--border)}
-.err-box{background:#fee2e2;border:1.5px solid #fecaca;border-radius:12px;padding:12px;margin-top:16px;font-size:.8rem;color:#991b1b;text-align:right;word-break:break-word}
 </style>
 </head>
 <body>
@@ -102,149 +101,80 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
 const auth = firebase.auth();
+auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(e => console.warn('Auth persistence:', e));
 const googleProvider = new firebase.auth.GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 const APP_LOGO = "https://up6.cc/2026/11/179555196156461.png";
 
 /* ============ State ============ */
 const S = {
-  user: null,
-  tempGoogleUser: null,
+  user: null,           // { uid, email, name, photo, phone, areaId, areaName }
+  tempGoogleUser: null, // بيانات جوجل المؤقتة قبل إكمال رقم الهاتف والمنطقة
   page: 'splash',
   categories: {},
   products: {},
-  cart: {},
+  cart: {},             // { productId: qty }
   areas: {},
   activeCategory: 'all',
+  myOrders: [],
   settings: {},
-  authLoading: false,
-  currentProduct: null,
-  lastError: ''
+  authLoading: false
 };
 
 const app = document.getElementById('app');
 
 /* ============ Helpers ============ */
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3500)}
+function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2800)}
 function money(n){return (Number(n)||0).toLocaleString('ar-LY')+' د.ل'}
 function goTo(p){S.page=p;render()}
 function saveSession(){if(S.user)localStorage.setItem('bizo_user',JSON.stringify(S.user))}
 function clearSession(){localStorage.removeItem('bizo_user')}
 function loadSession(){try{const u=localStorage.getItem('bizo_user');if(u)return JSON.parse(u)}catch(e){}return null}
-function saveCurrentProduct(){try{if(S.currentProduct)sessionStorage.setItem('bizo_current_product',S.currentProduct);else sessionStorage.removeItem('bizo_current_product')}catch(e){}}
-function loadCurrentProduct(){try{return sessionStorage.getItem('bizo_current_product')}catch(e){return null}}
 
 /* ============ Init ============ */
 function init(){
   S.user = loadSession();
-  S.currentProduct = loadCurrentProduct();
-
-  S.page = (S.user && S.user.phone && S.user.areaId) ? 'shop' : 'splash';
-  render();
-
   db.ref('categories').on('value',s=>{S.categories=s.val()||{};if(S.page==='shop')render()});
-  db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop'||S.page==='product')render()});
-  db.ref('deliveryAreas').on('value',s=>{S.areas=s.val()||{};if(S.page==='completeProfile'||S.page==='checkout')render()});
-  db.ref('appSettings').on('value',s=>{S.settings=s.val()||{}});
-
-  auth.onAuthStateChanged(fbUser => {
-    if (!fbUser && S.user && !S.tempGoogleUser && !S.authLoading) {
-      clearSession();
-      S.user = null;
-      if (S.page !== 'splash' && S.page !== 'completeProfile') goTo('splash');
-    }
+  db.ref('products').on('value',s=>{S.products=s.val()||{};if(S.page==='shop')render()});
+  db.ref('deliveryAreas').on('value',s=>{
+    S.areas=s.val()||{};
+    if(S.page==='completeProfile'||S.page==='checkout')render();
   });
-}
+  db.ref('appSettings').on('value',s=>{S.settings=s.val()||{}});
+  db.ref('sections').on('value',s=>{S.sections=s.val()||{}});
 
-/* ============ Google Login — Popup أولاً، Redirect كبديل ============ */
-async function loginWithGoogle(){
-  if(S.authLoading) return;
-  S.authLoading = true;
-  S.lastError = '';
-  render();
-
-  try {
-    // المحاولة 1: Popup (يعمل في معظم البيئات)
-    const result = await auth.signInWithPopup(googleProvider);
-    S.authLoading = false;
-    await finishGoogleLogin(result.user);
-    return;
-  } catch (e) {
-    console.warn('Popup failed:', e.code, e.message);
-
-    // إذا أغلق المستخدم النافذة يدوياً — لا داعي للبديل
-    if (e.code === 'auth/popup-closed-by-user') {
-      S.authLoading = false;
-      render();
-      return;
-    }
-
-    // إذا كان الخطأ "popup-blocked" أو غيره — جرّب Redirect
-    if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment' || e.code === 'auth/cancelled-popup-request') {
-      try {
-        await auth.signInWithRedirect(googleProvider);
-        return;
-      } catch (e2) {
-        S.authLoading = false;
-        S.lastError = (e2.code || '') + ' — ' + (e2.message || '');
-        render();
-        toast('تعذر تسجيل الدخول');
-        return;
-      }
-    }
-
-    // خطأ آخر — اعرض التفاصيل للمستخدم
-    S.authLoading = false;
-    S.lastError = (e.code || '') + ' — ' + (e.message || '');
-    render();
-    toast('تعذر تسجيل الدخول: ' + (e.code || e.message || ''));
+  if(S.user && S.user.phone && S.user.areaId){
+    goTo('shop');
+  }else{
+    goTo('splash');
   }
 }
+init();
 
-/* ============ إكمال تسجيل الدخول ============ */
-async function finishGoogleLogin(gUser){
-  try {
-    const snap = await db.ref('users/' + gUser.uid).get();
-    const existingData = snap.val();
-
-    if (existingData && existingData.phone && existingData.areaId) {
-      S.user = {
-        uid: gUser.uid,
-        email: gUser.email || existingData.email || '',
-        name: existingData.name || gUser.displayName || 'مستخدم بيزو',
-        photo: gUser.photoURL || existingData.photo || '',
-        phone: existingData.phone,
-        areaId: existingData.areaId,
-        areaName: existingData.areaName || ''
-      };
-      saveSession();
-      S.authLoading = false;
-      toast('مرحباً بعودتك ' + S.user.name);
-      goTo('shop');
-    } else {
-      S.tempGoogleUser = {
-        uid: gUser.uid,
-        email: gUser.email || '',
-        name: gUser.displayName || '',
-        photo: gUser.photoURL || ''
-      };
-      S.authLoading = false;
-      goTo('completeProfile');
-    }
-  } catch (e) {
-    S.authLoading = false;
-    S.lastError = (e.code || '') + ' — ' + (e.message || '');
-    render();
-    toast('خطأ في قراءة البيانات');
+/* ============ Router / Render ============ */
+function render(){
+  if(!S.user && !['splash','completeProfile'].includes(S.page)){
+    goTo('splash');return;
   }
+  const routes={
+    splash:renderSplash,
+    completeProfile:renderCompleteProfile,
+    shop:renderShop,
+    product:renderProduct,
+    cart:renderCart,
+    checkout:renderCheckout,
+    orders:renderOrders,
+    account:renderAccount
+  };
+  app.innerHTML=(routes[S.page]||renderSplash)();
+  bindEvents();
 }
 
-/* ============ Splash ============ */
+/* ============ Splash / Google Login ============ */
 function renderSplash(){
   return `<div class="page" style="justify-content:center;text-align:center">
-    <img src="${APP_LOGO}" alt="بيزو" class="app-logo-img" onerror="this.style.display='none'">
+    <img src="${APP_LOGO}" alt="بيزو" class="app-logo-img">
     <div class="logo">بيزو</div>
     <p class="tag">متجرك الإلكتروني الشامل</p>
     <div style="margin-top:48px">
@@ -258,13 +188,88 @@ function renderSplash(){
         <span>${S.authLoading?'جاري الاتصال بجوجل...':'المتابعة باستخدام Google'}</span>
       </button>
     </div>
-    ${S.lastError ? `<div class="err-box"><b>سبب الخطأ:</b><br>${esc(S.lastError)}</div>` : ''}
   </div>`;
 }
 
-/* ============ Complete Profile ============ */
+/* ============ Google Auth Logic ============ */
+function authErrorMessage(e){
+  const messages = {
+    'auth/unauthorized-domain': 'هذا النطاق غير مضاف إلى النطاقات المسموح بها في Firebase Authentication.',
+    'auth/operation-not-allowed': 'تسجيل الدخول باستخدام Google غير مفعّل في Firebase Console.',
+    'auth/popup-blocked': 'المتصفح منع نافذة Google. سنحاول فتح تسجيل الدخول بطريقة التحويل.',
+    'auth/popup-closed-by-user': 'أغلقت نافذة تسجيل الدخول قبل إكمال العملية.',
+    'auth/network-request-failed': 'تعذر الاتصال. تحقق من الإنترنت ثم أعد المحاولة.',
+    'auth/cancelled-popup-request': 'هناك محاولة تسجيل دخول أخرى قيد التنفيذ.'
+  };
+  return messages[e.code] || ('تعذر تسجيل الدخول: ' + (e.message || 'خطأ غير معروف'));
+}
+
+async function finishGoogleLogin(gUser){
+  const snap = await db.ref('users/' + gUser.uid).get();
+  const existingData = snap.val();
+  if(existingData && existingData.phone && existingData.areaId){
+    S.user = {
+      uid: gUser.uid,
+      email: gUser.email || existingData.email || '',
+      name: existingData.name || gUser.displayName || 'مستخدم بيزو',
+      photo: gUser.photoURL || existingData.photo || '',
+      phone: existingData.phone,
+      areaId: existingData.areaId,
+      areaName: existingData.areaName || ''
+    };
+    saveSession();
+    S.tempGoogleUser = null;
+    S.authLoading = false;
+    toast('مرحباً بعودتك ' + S.user.name);
+    goTo('shop');
+  } else {
+    S.tempGoogleUser = {
+      uid: gUser.uid,
+      email: gUser.email || '',
+      name: gUser.displayName || '',
+      photo: gUser.photoURL || ''
+    };
+    S.authLoading = false;
+    goTo('completeProfile');
+  }
+}
+
+async function loginWithGoogle(){
+  if(S.authLoading) return;
+  S.authLoading = true;
+  render();
+  try{
+    // اختيار الحساب في كل مرة لتجنب الدخول بحساب Google غير المقصود
+    googleProvider.setCustomParameters({ prompt: 'select_account' });
+    await auth.signInWithPopup(googleProvider);
+    // auth state is returned by signInWithPopup; process the credential user
+    const currentUser = auth.currentUser;
+    if(!currentUser) throw new Error('لم يتم استلام حساب Google');
+    await finishGoogleLogin(currentUser);
+  }catch(e){
+    console.error('Google sign-in error:', e);
+    // بعض متصفحات الهاتف تمنع popup؛ نستخدم redirect كخيار احتياطي
+    if(['auth/popup-blocked','auth/operation-not-supported-in-this-environment'].includes(e.code)){
+      try {
+        await auth.signInWithRedirect(googleProvider);
+        return;
+      } catch(redirectError) {
+        console.error('Google redirect error:', redirectError);
+        S.authLoading = false;
+        render();
+        toast(authErrorMessage(redirectError));
+        return;
+      }
+    }
+    S.authLoading = false;
+    render();
+    if(e.code !== 'auth/popup-closed-by-user') toast(authErrorMessage(e));
+  }
+}
+
+/* ============ Complete Profile (Phone & Area - No OTP) ============ */
 function renderCompleteProfile(){
-  if(!S.tempGoogleUser){S.page='splash';return renderSplash()}
+  if(!S.tempGoogleUser){goTo('splash');return ''}
   const areas = Object.entries(S.areas).filter(([id,a])=>a.enabled!==false);
   return `<div class="page">
     <div class="header-bar">
@@ -298,6 +303,8 @@ function renderCompleteProfile(){
 
 function cancelProfileSetup(){
   auth.signOut().catch(()=>{});
+  S.user = null;
+  clearSession();
   S.tempGoogleUser=null;
   goTo('splash');
 }
@@ -355,8 +362,8 @@ function renderShop(){
         <div style="font-size:.85rem;color:var(--muted)">أهلاً بك 👋</div>
         <div style="font-weight:800;font-size:1.2rem">${esc(S.user.name||S.user.phone)}</div>
       </div>
-      ${S.user.photo
-        ? `<img src="${esc(S.user.photo)}" class="user-avatar" style="cursor:pointer" onclick="goTo('account')" alt="حسابي">`
+      ${S.user.photo 
+        ? `<img src="${esc(S.user.photo)}" class="user-avatar" style="cursor:pointer" onclick="goTo('account')" alt="حسابي">` 
         : `<button class="back-btn" onclick="goTo('account')">👤</button>`}
     </div>
     <div class="cat-pills">
@@ -383,9 +390,9 @@ function setCategory(id){S.activeCategory=id;render()}
 
 /* ============ Product ============ */
 function renderProduct(){
-  const id = S.currentProduct;
-  const p = S.products[id];
-  if(!p){S.page='shop';return renderShop()}
+  const id=S.page==='product'?S.currentProduct:null;
+  const p=S.products[id];
+  if(!p){goTo('shop');return ''}
   const qty=S.cart[id]||0;
   return `<div class="page">
     <div class="header-bar">
@@ -415,11 +422,7 @@ function renderProduct(){
   </div>`;
 }
 
-function openProduct(id){
-  S.currentProduct = id;
-  saveCurrentProduct();
-  goTo('product');
-}
+function openProduct(id){S.currentProduct=id;goTo('product')}
 
 /* ============ Cart ============ */
 function renderCart(){
@@ -463,7 +466,7 @@ function changeQty(id,d){
 /* ============ Checkout ============ */
 function renderCheckout(){
   const items=Object.entries(S.cart).map(([id,qty])=>({id,qty,p:S.products[id]})).filter(x=>x.p);
-  if(!items.length){S.page='cart';return renderCart()}
+  if(!items.length){goTo('cart');return ''}
   const subtotal=items.reduce((s,x)=>s+x.p.price*x.qty,0);
   const areas=Object.entries(S.areas).filter(([id,a])=>a.enabled!==false);
   const defaultArea = S.areas[S.user.areaId];
@@ -580,28 +583,14 @@ function renderOrders(){
   </div>`;
 }
 
-let ordersListenerRef = null;
-
 function loadMyOrders(){
   const el=document.getElementById('ordersList');
-  if(!el) return;
-
-  if (ordersListenerRef) {
-    ordersListenerRef.off();
-    ordersListenerRef = null;
-  }
-
-  ordersListenerRef = db.ref('orders').orderByChild('userUid').equalTo(S.user.uid);
-  ordersListenerRef.on('value', s => {
-    const data = s.val() || {};
-    const arr = Object.values(data).sort((a,b)=>b.createdAt-a.createdAt);
-    const el2 = document.getElementById('ordersList');
-    if (!el2) return;
-    if(!arr.length){
-      el2.innerHTML='<div class="empty"><div class="empty-icon">📋</div><p>لا توجد طلبات بعد</p></div>';
-      return;
-    }
-    el2.innerHTML=arr.map(o=>{
+  if(!el)return;
+  db.ref('orders').orderByChild('userPhone').equalTo(S.user.phone).on('value',s=>{
+    const data=s.val()||{};
+    const arr=Object.values(data).sort((a,b)=>b.createdAt-a.createdAt);
+    if(!arr.length){el.innerHTML='<div class="empty"><div class="empty-icon">📋</div><p>لا توجد طلبات بعد</p></div>';return}
+    el.innerHTML=arr.map(o=>{
       const st=o.status||'new';
       const badge={new:'جديد',preparing:'قيد التجهيز',delivering:'قيد التوصيل',completed:'مكتمل',cancelled:'ملغي'}[st]||st;
       return `<div class="cart-item" style="flex-direction:column;align-items:stretch">
@@ -645,47 +634,14 @@ function renderAccount(){
 function logout(){
   auth.signOut().catch(()=>{});
   clearSession();
-  S.user=null;S.cart={};S.tempGoogleUser=null;S.currentProduct=null;
-  try{sessionStorage.removeItem('bizo_current_product')}catch(e){}
-  if (ordersListenerRef) { ordersListenerRef.off(); ordersListenerRef = null; }
+  S.user=null;S.cart={};S.tempGoogleUser=null;
   goTo('splash');
 }
 
-/* ============ Router ============ */
-function render(){
-  if(!S.user && !['splash','completeProfile'].includes(S.page)){
-    S.page = 'splash';
-  }
-  const routes={
-    splash:renderSplash,
-    completeProfile:renderCompleteProfile,
-    shop:renderShop,
-    product:renderProduct,
-    cart:renderCart,
-    checkout:renderCheckout,
-    orders:renderOrders,
-    account:renderAccount
-  };
-  try {
-    app.innerHTML=(routes[S.page]||renderSplash)();
-  } catch(e) {
-    console.error('Render error:', e);
-    app.innerHTML = `<div class="page" style="justify-content:center;text-align:center">
-      <div style="font-size:3rem;margin-bottom:16px">⚠️</div>
-      <h2 style="color:var(--text)">حدث خطأ</h2>
-      <p style="color:var(--muted);margin-bottom:20px">${esc(e.message)}</p>
-      <button class="btn" onclick="location.reload()">إعادة التحميل</button>
-    </div>`;
-  }
-  bindEvents();
-}
-
+/* ============ Event binding ============ */
 function bindEvents(){
   if(S.page==='orders')loadMyOrders();
 }
-
-/* ============ تشغيل التطبيق ============ */
-init();
 </script>
 </body>
 </html>
